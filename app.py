@@ -27,7 +27,7 @@ def load_models():
 diaphragm_model, seven_seg_model = load_models()
 
 # =============================
-# SIDEBAR INPUTS
+# SIDEBAR
 # =============================
 with st.sidebar:
     st.header("⚙️ Meter Configuration")
@@ -48,6 +48,14 @@ with st.sidebar:
     else:
         unit = "m³"
 
+    conf_threshold = st.slider(
+        "🎯 Detection Confidence",
+        min_value=0.10,
+        max_value=0.80,
+        value=0.35,
+        step=0.05
+    )
+
     st.markdown("---")
     st.info(f"📌 Output Unit: **{unit}**")
 
@@ -55,14 +63,13 @@ with st.sidebar:
 # CAMERA INPUT
 # =============================
 st.subheader("📷 Capture Meter Image")
-
 camera_img = st.camera_input("Click meter image")
 
 # =============================
-# PROCESS IMAGE
+# DIAPHRAGM PROCESSING
 # =============================
-def process_diaphragm(img):
-    preds = diaphragm_model(img, imgsz=640, conf=0.35, iou=0.45)
+def process_diaphragm(img, conf_thres):
+    preds = diaphragm_model(img, imgsz=640, conf=conf_thres, iou=0.45)
     boxes = preds[0].boxes
     tokens = []
 
@@ -74,43 +81,70 @@ def process_diaphragm(img):
         x1, _, x2, _ = box.xyxy[0].tolist()
         x_center = (x1 + x2) / 2
 
-        if label.isdigit() and conf > 0.25:
+        if label.isdigit() and conf >= conf_thres:
             tokens.append((x_center, label))
 
     tokens.sort(key=lambda x: x[0])
     reading = "".join(t[1] for t in tokens)
 
-    return reading + " m³" if reading else None
+    return f"{reading} m³" if reading else None
 
+# =============================
+# 7-SEGMENT PROCESSING (FIXED)
+# =============================
+def process_7segment(img, unit, conf_thres):
+    preds = seven_seg_model(
+        img,
+        imgsz=640,
+        conf=conf_thres,
+        iou=0.45
+    )
 
-def process_7segment(img, unit):
-    preds = seven_seg_model(img, imgsz=640, conf=0.20, iou=0.45)
     boxes = preds[0].boxes
     tokens = []
+
+    h, w, _ = img.shape
+
+    # LCD vertical band (middle area)
+    y_min = int(h * 0.35)
+    y_max = int(h * 0.65)
 
     for box in boxes:
         cls_id = int(box.cls[0])
         conf = float(box.conf[0])
         label = seven_seg_model.names[cls_id]
 
-        x1, _, x2, _ = box.xyxy[0].tolist()
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
         x_center = (x1 + x2) / 2
+        y_center = (y1 + y2) / 2
+        box_height = y2 - y1
 
-        if label.isdigit() and conf > 0.25:
+        # 🔒 FILTER NOISE
+        if not (y_min <= y_center <= y_max):
+            continue
+
+        if box_height < h * 0.05:
+            continue
+
+        if label.isdigit() and conf >= conf_thres:
             tokens.append((x_center, label))
-        elif label == "10" and conf > 0.15:
+        elif label == "10" and conf >= (conf_thres - 0.1):
             tokens.append((x_center, "."))
 
     tokens.sort(key=lambda x: x[0])
-    reading = "".join(t[1] for t in tokens)
+    raw = "".join(t[1] for t in tokens)
 
-    # Cleanup decimals
-    if reading.count(".") > 1:
-        reading = reading.replace(".", "", reading.count(".") - 1)
-    if reading.startswith("."):
-        reading = reading[1:]
+    # CLEANUP
+    if raw.count(".") > 1:
+        raw = raw.replace(".", "", raw.count(".") - 1)
+    if raw.startswith("."):
+        raw = raw[1:]
 
-    return f"{reading} {unit}" if reading else None
+    # SAFETY LIMIT
+    if len(raw) > 8:
+        raw = raw[:8]
+
+    return f"{raw} {unit}" if raw else None
 
 # =============================
 # RUN PREDICTION
@@ -125,10 +159,9 @@ if camera_img is not None:
     with st.spinner("🔎 Detecting meter reading..."):
         try:
             if meter_type == "Diaphragm":
-                result = process_diaphragm(img)
+                result = process_diaphragm(img, conf_threshold)
             else:
-                result = process_7segment(img, unit)
-
+                result = process_7segment(img, unit, conf_threshold)
         except Exception as e:
             st.error(str(e))
             result = None
@@ -143,7 +176,8 @@ if camera_img is not None:
                 "Meter Type": meter_type,
                 "MSN": msn,
                 "IVRS": ivrs,
-                "Reading": result
+                "Reading": result,
+                "Confidence": conf_threshold
             })
     else:
         st.error("❌ Meter reading not detected")
