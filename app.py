@@ -65,7 +65,7 @@ camera_img = st.camera_input("Click meter image")
 # =============================
 # DRAW BOUNDING BOXES
 # =============================
-def draw_boxes(img, boxes, class_names, valid_digits, conf_thres):
+def draw_boxes(img, boxes, class_names, conf_thres):
     draw = img.copy()
 
     for box in boxes:
@@ -75,13 +75,18 @@ def draw_boxes(img, boxes, class_names, valid_digits, conf_thres):
 
         x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
 
-        is_valid = label in valid_digits and conf >= conf_thres
-        color = (0, 255, 0) if is_valid else (0, 0, 255)
+        # VALID CLASSES
+        is_digit = label in "0123456789" and conf >= conf_thres
+        is_dot = label == "10" and conf >= conf_thres
+
+        color = (0, 255, 0) if (is_digit or is_dot) else (0, 0, 255)
+
+        display_label = "." if label == "10" else label
 
         cv2.rectangle(draw, (x1, y1), (x2, y2), color, 2)
         cv2.putText(
             draw,
-            f"{label} ({conf:.2f})",
+            f"{display_label} ({conf:.2f})",
             (x1, max(y1 - 8, 15)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
@@ -112,10 +117,10 @@ def process_diaphragm(img, conf_thres):
     tokens.sort(key=lambda x: x[0])
     reading = "".join(d for _, d in tokens)
 
-    return reading + " m³" if reading else None, boxes
+    return (reading + " m³") if reading else None, boxes
 
 # =============================
-# 7 SEGMENT PROCESSING (FIXED)
+# 7 SEGMENT PROCESSING (FINAL FIX)
 # =============================
 def process_7segment(img, unit, conf_thres):
     preds = seven_seg_model(img, imgsz=640, conf=conf_thres, iou=0.45)
@@ -125,8 +130,6 @@ def process_7segment(img, unit, conf_thres):
     h, _, _ = img.shape
     y_min, y_max = int(h * 0.35), int(h * 0.65)
 
-    VALID_DIGITS = set("0123456789")
-
     for box in boxes:
         label = seven_seg_model.names[int(box.cls[0])]
         conf = float(box.conf[0])
@@ -134,24 +137,43 @@ def process_7segment(img, unit, conf_thres):
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         x_center = (x1 + x2) / 2
         y_center = (y1 + y2) / 2
+        box_height = y2 - y1
 
+        # LCD REGION FILTER
         if not (y_min <= y_center <= y_max):
             continue
 
-        if label in VALID_DIGITS and conf >= conf_thres:
+        if box_height < h * 0.05:
+            continue
+
+        # DIGITS
+        if label in "0123456789" and conf >= conf_thres:
             tokens.append((x_center, label))
+
+        # DOT (CLASS 10)
+        elif label == "10" and conf >= conf_thres:
+            tokens.append((x_center, "."))
+
+        # IGNORE 11, 12, OTHERS
+        else:
+            continue
 
     tokens.sort(key=lambda x: x[0])
 
-    # Digit spacing filter (kills ghost '11')
+    # REMOVE CLOSE DUPLICATES
     cleaned = []
     min_gap = 18
-    for x, d in tokens:
+    for x, t in tokens:
         if not cleaned or (x - cleaned[-1][0]) >= min_gap:
-            cleaned.append((x, d))
+            cleaned.append((x, t))
 
-    raw = "".join(d for _, d in cleaned)
+    raw = "".join(t for _, t in cleaned)
 
+    # CLEANUP
+    if raw.count(".") > 1:
+        raw = raw.replace(".", "", raw.count(".") - 1)
+    if raw.startswith("."):
+        raw = raw[1:]
     if len(raw) > 8:
         raw = raw[:8]
 
@@ -171,22 +193,10 @@ if camera_img is not None:
     with st.spinner("🔎 Detecting meter reading..."):
         if meter_type == "Diaphragm":
             result, boxes = process_diaphragm(img, conf_threshold)
-            boxed_img = draw_boxes(
-                img,
-                boxes,
-                diaphragm_model.names,
-                set("0123456789"),
-                conf_threshold
-            )
+            boxed_img = draw_boxes(img, boxes, diaphragm_model.names, conf_threshold)
         else:
             result, boxes = process_7segment(img, unit, conf_threshold)
-            boxed_img = draw_boxes(
-                img,
-                boxes,
-                seven_seg_model.names,
-                set("0123456789"),
-                conf_threshold
-            )
+            boxed_img = draw_boxes(img, boxes, seven_seg_model.names, conf_threshold)
 
     st.subheader("🟦 Detection Visualization")
     st.image(boxed_img, use_container_width=True)
